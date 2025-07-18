@@ -3,11 +3,16 @@ package api
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
+	"strconv"
+
+	"github.com/OmarMWarraich/femProject/internal/middleware"
 	"github.com/OmarMWarraich/femProject/internal/store"
 	"github.com/OmarMWarraich/femProject/internal/utils"
+	"github.com/go-chi/chi/v5"
 )
 
 type WorkoutHandler struct {
@@ -38,6 +43,7 @@ func (wh *WorkoutHandler) HandleGetWorkoutByID(w http.ResponseWriter, r *http.Re
 	}
 
 	utils.WriteJSON(w, http.StatusOK, utils.Envelope{"workout": workout})
+
 }
 
 func (wh *WorkoutHandler) HandleCreateWorkout(w http.ResponseWriter, r *http.Request) {
@@ -49,6 +55,14 @@ func (wh *WorkoutHandler) HandleCreateWorkout(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	currentUser := middleware.GetUser(r)
+	if currentUser == nil || currentUser == store.AnonymousUser {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "you must bed logged in"})
+		return
+	}
+
+	workout.UserID = currentUser.ID
+
 	createdWorkout, err := wh.workoutStore.CreateWorkout(&workout)
 	if err != nil {
 		wh.logger.Printf("ERROR: createWorkout: %v", err)
@@ -56,13 +70,13 @@ func (wh *WorkoutHandler) HandleCreateWorkout(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	utils.WriteJSON(w, http.StatusCreated, utils.Envelope{"created workout": createdWorkout})
+	utils.WriteJSON(w, http.StatusCreated, utils.Envelope{"workout": createdWorkout})
 }
 
 func (wh *WorkoutHandler) HandleUpdateWorkoutByID(w http.ResponseWriter, r *http.Request) {
 	workoutID, err := utils.ReadIDParam(r)
 	if err != nil {
-		wh.logger.Printf("ERROR: readIDParams: %v", err)
+		wh.logger.Printf("ERROR: readIDParam: %v", err)
 		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "invalid workout update id"})
 		return
 	}
@@ -71,6 +85,7 @@ func (wh *WorkoutHandler) HandleUpdateWorkoutByID(w http.ResponseWriter, r *http
 	if err != nil {
 		wh.logger.Printf("ERROR: getWorkoutByID: %v", err)
 		utils.WriteJSON(w, http.StatusInternalServerError, utils.Envelope{"error": "internal server error"})
+		return
 	}
 
 	if existingWorkout == nil {
@@ -89,29 +104,47 @@ func (wh *WorkoutHandler) HandleUpdateWorkoutByID(w http.ResponseWriter, r *http
 
 	err = json.NewDecoder(r.Body).Decode(&updateWorkoutRequest)
 	if err != nil {
-		wh.logger.Printf("ERROR: decodingUpdateWorkout: %v", err)
-		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "invalid request sent"})
+		wh.logger.Printf("ERROR: decodingUpdateRequest: %v", err)
+		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "invalid request payload"})
 		return
 	}
 
 	if updateWorkoutRequest.Title != nil {
 		existingWorkout.Title = *updateWorkoutRequest.Title
 	}
-
 	if updateWorkoutRequest.Description != nil {
 		existingWorkout.Description = *updateWorkoutRequest.Description
 	}
-
 	if updateWorkoutRequest.DurationMinutes != nil {
 		existingWorkout.DurationMinutes = *updateWorkoutRequest.DurationMinutes
 	}
-
 	if updateWorkoutRequest.CaloriesBurned != nil {
 		existingWorkout.CaloriesBurned = *updateWorkoutRequest.CaloriesBurned
 	}
-
 	if updateWorkoutRequest.Entries != nil {
 		existingWorkout.Entries = updateWorkoutRequest.Entries
+	}
+
+	currentUser := middleware.GetUser(r)
+	if currentUser == nil || currentUser == store.AnonymousUser {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "you must be logged in to update"})
+		return
+	}
+
+	workoutOwner, err := wh.workoutStore.GetWorkoutOwner(workoutID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.WriteJSON(w, http.StatusNotFound, utils.Envelope{"error": "workout does not exist"})
+			return
+		}
+
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.Envelope{"error": "internal server error"})
+		return
+	}
+
+	if workoutOwner != currentUser.ID {
+		utils.WriteJSON(w, http.StatusForbidden, utils.Envelope{"error": "you are not authorized to update this workout"})
+		return
 	}
 
 	err = wh.workoutStore.UpdateWorkout(existingWorkout)
@@ -121,28 +154,53 @@ func (wh *WorkoutHandler) HandleUpdateWorkoutByID(w http.ResponseWriter, r *http
 		return
 	}
 
-	utils.WriteJSON(w, http.StatusOK, utils.Envelope{"updated workout": existingWorkout})
+	utils.WriteJSON(w, http.StatusOK, utils.Envelope{"workout": existingWorkout})
 
 }
 
 func (wh *WorkoutHandler) HandleDeleteWorkoutByID(w http.ResponseWriter, r *http.Request) {
-	workoutID, err := utils.ReadIDParam(r)
+	paramsWorkoutID := chi.URLParam(r, "id")
+	if paramsWorkoutID == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	workoutID, err := strconv.ParseInt(paramsWorkoutID, 10, 64)
 	if err != nil {
-		wh.logger.Printf("ERROR: readIDParam: %v", err)
-		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "invalid workout delete id"})
+		http.NotFound(w, r)
+		return
+	}
+
+	currentUser := middleware.GetUser(r)
+	if currentUser == nil || currentUser == store.AnonymousUser {
+		utils.WriteJSON(w, http.StatusBadRequest, utils.Envelope{"error": "you must be logged in to update"})
+		return
+	}
+
+	workoutOwner, err := wh.workoutStore.GetWorkoutOwner(workoutID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			utils.WriteJSON(w, http.StatusNotFound, utils.Envelope{"error": "workout does not exist"})
+			return
+		}
+
+		utils.WriteJSON(w, http.StatusInternalServerError, utils.Envelope{"error": "internal server error"})
+		return
+	}
+
+	if workoutOwner != currentUser.ID {
+		utils.WriteJSON(w, http.StatusForbidden, utils.Envelope{"error": "you are not authorized to update this workout"})
 		return
 	}
 
 	err = wh.workoutStore.DeleteWorkout(workoutID)
 	if err == sql.ErrNoRows {
-		wh.logger.Printf("ERROR: deleteWorkout: %v", err)
-		utils.WriteJSON(w, http.StatusInternalServerError, utils.Envelope{"error": "internal server error"})
+		http.Error(w, "workout not found", http.StatusNotFound)
 		return
 	}
 
 	if err != nil {
-		wh.logger.Printf("ERROR: deleting workout: %v", err)
-		utils.WriteJSON(w, http.StatusNotImplemented, utils.Envelope{"error": "deleting workout"})
+		http.Error(w, "error deleting workout", http.StatusInternalServerError)
 		return
 	}
 
